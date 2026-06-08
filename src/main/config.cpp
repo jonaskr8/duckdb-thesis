@@ -80,6 +80,7 @@ static const ConfigurationOption internal_options[] = {
     DUCKDB_GLOBAL(AllowedConfigsSetting),
     DUCKDB_GLOBAL(AllowedDirectoriesSetting),
     DUCKDB_GLOBAL(AllowedPathsSetting),
+    DUCKDB_SETTING(ApproximateJoinOrderThresholdSetting),
     DUCKDB_SETTING(ArrowLargeBufferSizeSetting),
     DUCKDB_SETTING(ArrowLosslessConversionSetting),
     DUCKDB_SETTING(ArrowOutputListViewSetting),
@@ -237,14 +238,14 @@ static const ConfigurationOption internal_options[] = {
     DUCKDB_SETTING(ZstdMinStringLengthSetting),
     FINAL_SETTING};
 
-static const ConfigurationAlias setting_aliases[] = {DUCKDB_SETTING_ALIAS("configure_metrics", 28),
-                                                     DUCKDB_SETTING_ALIAS("custom_profiling_settings", 28),
-                                                     DUCKDB_SETTING_ALIAS("memory_limit", 122),
-                                                     DUCKDB_SETTING_ALIAS("null_order", 55),
-                                                     DUCKDB_SETTING_ALIAS("profiling_output", 143),
-                                                     DUCKDB_SETTING_ALIAS("user", 160),
-                                                     DUCKDB_SETTING_ALIAS("wal_autocheckpoint", 27),
-                                                     DUCKDB_SETTING_ALIAS("worker_threads", 158),
+static const ConfigurationAlias setting_aliases[] = {DUCKDB_SETTING_ALIAS("configure_metrics", 29),
+                                                     DUCKDB_SETTING_ALIAS("custom_profiling_settings", 29),
+                                                     DUCKDB_SETTING_ALIAS("memory_limit", 123),
+                                                     DUCKDB_SETTING_ALIAS("null_order", 56),
+                                                     DUCKDB_SETTING_ALIAS("profiling_output", 144),
+                                                     DUCKDB_SETTING_ALIAS("user", 161),
+                                                     DUCKDB_SETTING_ALIAS("wal_autocheckpoint", 28),
+                                                     DUCKDB_SETTING_ALIAS("worker_threads", 159),
                                                      FINAL_ALIAS};
 
 vector<ConfigurationOption> DBConfig::GetOptions() {
