@@ -581,6 +581,8 @@ unique_ptr<ColumnReader> ParquetReader::CreateReaderRecursive(ClientContext &con
 	switch (schema.schema_type) {
 	case ParquetColumnSchemaType::FILE_ROW_NUMBER:
 		return make_uniq<RowNumberColumnReader>(*this, schema);
+	case ParquetColumnSchemaType::FILE_ROW_GROUP_NUMBER:
+		return make_uniq<RowGroupColumnReader>(*this, schema);
 	case ParquetColumnSchemaType::GEOMETRY: {
 		return GeometryColumnReader::Create(*this, schema, context);
 	}
@@ -907,6 +909,10 @@ static ParquetColumnSchema FileRowNumberSchema() {
 	return ParquetColumnSchema::FileRowNumber();
 }
 
+static ParquetColumnSchema FileRowGroupNumberSchema() {
+	return ParquetColumnSchema::FileRowGroupNumber();
+}
+
 unique_ptr<ParquetColumnSchema> ParquetReader::ParseSchema(ClientContext &context) {
 	auto file_meta_data = GetFileMetadata();
 	idx_t next_schema_idx = 0;
@@ -990,6 +996,8 @@ void ParquetReader::InitializeSchema(ClientContext &context) {
 void ParquetReader::AddVirtualColumn(column_t virtual_column_id) {
 	if (virtual_column_id == MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER) {
 		root_schema->children.push_back(FileRowNumberSchema());
+	} else if (virtual_column_id == ParquetReader::COLUMN_IDENTIFIER_FILE_ROW_GROUP_NUMBER) {
+		root_schema->children.push_back(FileRowGroupNumberSchema());
 	} else {
 		throw InternalException("Unsupported virtual column id %d for parquet reader", virtual_column_id);
 	}
@@ -1386,10 +1394,7 @@ void ParquetReader::PrepareRowGroupBuffer(ParquetReaderScanState &state, idx_t i
 		}
 	}
 
-	for (auto &column_reader : state.column_readers) {
-		column_reader->InitializeRead(state.group_idx_list[state.current_group], group.columns,
-		                              *state.thrift_file_proto);
-	}
+	column_reader.InitializeRead(state.group_idx_list[state.current_group], group.columns, *state.thrift_file_proto);
 }
 
 idx_t ParquetReader::NumRows() const {
@@ -1660,6 +1665,10 @@ ParquetPrefetchStrategy ParquetReader::ColumnWisePrefetch(ParquetReaderScanState
 		}
 		auto col_idx = MultiFileLocalIndex(i);
 		auto &child = state.GetColumnReader(col_idx);
+		if (child.IsSkipped()) {
+			//! Column reader is skipped entirely
+			continue;
+		}
 		child.RegisterPrefetch(trans, true);
 		if (log_prefetch) {
 			pending_registrations.emplace_back(child.Schema().name, child.FileOffset());
@@ -1732,9 +1741,15 @@ AsyncResult ParquetReader::Schedule(ClientContext &context, ParquetReaderScanSta
 	}
 
 	auto &group = GetGroup(state);
+	const bool row_group_skipped = state.offset_in_group == (idx_t)group.num_rows;
+	if (row_group_skipped) {
+		++state.row_groups_skipped;
+	} else {
+		++state.row_groups_read;
+	}
 	if (state.op) {
 		DUCKDB_LOG(context, PhysicalOperatorLogType, *state.op, "ParquetReader",
-		           state.offset_in_group == (idx_t)group.num_rows ? "SkipRowGroup" : "ReadRowGroup",
+		           row_group_skipped ? "SkipRowGroup" : "ReadRowGroup",
 		           {{"file", file.path}, {"row_group_id", to_string(state.group_idx_list[state.current_group])}});
 	}
 
