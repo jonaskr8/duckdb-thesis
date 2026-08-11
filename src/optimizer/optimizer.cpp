@@ -455,6 +455,12 @@ void Optimizer::RunBuiltInOptimizers() {
 			propagated_statistics = true;
 			removed_aggregate_children = propagator.HasRemovedAggregateChildren();
 		});
+
+		// Pulls up empty results
+		RunOptimizer(OptimizerType::EMPTY_RESULT_PULLUP, [&]() {
+			EmptyResultPullup empty_result_pullup;
+			plan = empty_result_pullup.Optimize(std::move(plan));
+		});
 	}
 	if (propagated_statistics) {
 		MultiStageAggregateRewriter costed_rewriter(*this, AggregateRewritePolicy::COST_BASED, false, statistics_map);
