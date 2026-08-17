@@ -564,8 +564,11 @@ void RemoveUnusedColumns::VisitOperator(unique_ptr<LogicalOperator> &op_ref) {
 			if (proj.expressions.empty()) {
 				// nothing references the projected expressions
 				// this happens in the case of e.g. EXISTS(SELECT * FROM ...)
-				// in this case we only need to project a single constant
-				proj.expressions.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(42)));
+				// in this case we can remove the projection
+				op_ref = std::move(op.children[0]);
+				RemoveUnusedColumns remove(*this, false);
+				remove.VisitOperator(op_ref);
+				return;
 			}
 		}
 		// then recurse into the children of this projection

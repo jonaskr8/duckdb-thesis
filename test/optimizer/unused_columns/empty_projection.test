@@ -1,0 +1,15 @@
+# name: test/optimizer/unused_columns/empty_projection.test
+# description: Test that projections with no referenced expressions are removed where possible
+# group: [unused_columns]
+
+query I nosort emptyproj1
+EXPLAIN
+SELECT 'final result'
+FROM (SELECT 'result 3'
+      FROM (SELECT 'result 2'
+            FROM (SELECT 'result 1')));
+----
+
+query I nosort emptyproj1
+EXPLAIN
+SELECT 'final result';
