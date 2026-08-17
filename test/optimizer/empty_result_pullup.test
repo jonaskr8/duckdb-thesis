@@ -1,0 +1,22 @@
+# name: test/optimizer/empty_result_pullup.test
+# description: Make sure empty results are propagated all the way
+# group: [optimizer]
+
+require tpch
+
+statement ok
+call dbgen(sf=0.1);
+
+query I nosort empty_result_pullup_1
+EXPLAIN SELECT o.o_custkey, o.o_orderdate, o.o_totalprice, c.c_custkey, c.c_name
+        FROM   nation AS n, orders AS o, customer AS c
+        WHERE  o.o_custkey = c.c_custkey
+        AND    c.c_nationkey = n.n_nationkey
+        AND    n.n_regionkey = 5;
+----
+
+query I nosort empty_result_pullup_1
+EXPLAIN SELECT * 
+        FROM orders AS o, customer AS c
+        WHERE 1 = 0;
+----
