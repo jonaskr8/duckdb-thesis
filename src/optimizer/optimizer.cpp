@@ -455,6 +455,8 @@ void Optimizer::RunBuiltInOptimizers() {
 			propagated_statistics = true;
 			removed_aggregate_children = propagator.HasRemovedAggregateChildren();
 		});
+
+		RunOptimizer(OptimizerType::EXPRESSION_REWRITER, [&]() { rewriter.VisitOperator(*plan); });
 	}
 	if (propagated_statistics) {
 		MultiStageAggregateRewriter costed_rewriter(*this, AggregateRewritePolicy::COST_BASED, false, statistics_map);

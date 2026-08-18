@@ -32,3 +32,23 @@ query I nosort casenorm3
 EXPLAIN SELECT X+2 FROM test
 ----
 
+statement ok
+INSERT INTO test(X) VALUES (1),(4),(5),(6),(19),(20),(21),(30),(31),(NULL);
+
+query I nosort casenorm4
+EXPLAIN 
+SELECT CASE WHEN X >= 5  THEN 'branch 1'
+			WHEN X <= 20 THEN 'branch 2'
+			ELSE              'branch 3'
+	   END
+FROM test
+WHERE X BETWEEN 10 AND 30;
+----
+
+query I nosort casenorm4
+EXPLAIN 
+SELECT 'branch 1'
+FROM test
+WHERE X BETWEEN 10 AND 30;
+----
+
