@@ -1,0 +1,22 @@
+# name: benchmark/tpch/optimizer/empty_result_pullup_after_stat_prop.benchmark
+# description: Benchmark of pulling up empty results created by statistics propagation
+# group: [optimizer]
+
+# include benchmark/tpch/tpch_load.benchmark.in
+
+name Empty Result Pullup after Statistics Propagation
+group micro
+subgroup optimizer
+
+require tpch
+
+load
+CALL dbgen(sf=1);
+
+
+run
+SELECT o.o_custkey, o.o_orderdate, o.o_totalprice, c.c_custkey, c.c_name
+    FROM   nation AS n, orders AS o, customer AS c,
+    WHERE  o.o_custkey <= c.c_custkey
+    AND    c.c_nationkey = n.n_nationkey
+    AND    n.n_regionkey = 5;
