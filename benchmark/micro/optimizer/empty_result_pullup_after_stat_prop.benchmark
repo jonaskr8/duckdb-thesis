@@ -1,4 +1,4 @@
-# name: benchmark/tpch/optimizer/empty_result_pullup_after_stat_prop.benchmark
+# name: benchmark/micro/optimizer/empty_result_pullup_after_stat_prop.benchmark
 # description: Benchmark of pulling up empty results created by statistics propagation
 # group: [optimizer]
 
