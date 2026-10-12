@@ -116,6 +116,8 @@ Optimizer::Optimizer(Binder &binder, ClientContext &context) : context(context),
 #endif
 }
 
+constexpr size_t iterations = 5;
+
 ClientContext &Optimizer::GetContext() {
 	return context;
 }
@@ -249,309 +251,311 @@ void Optimizer::RunBuiltInOptimizers() {
 	// that the filters the optimizer pushes into a view are not mistaken for the view restricting its own rows
 	LogicalSecureView::AnalyzeStatistics(*plan);
 
-	// first we perform expression rewrites using the ExpressionRewriter
-	// this does not change the logical plan structure, but only simplifies the expression trees
-	RunOptimizer(OptimizerType::EXPRESSION_REWRITER, [&]() {
-		rewriter.VisitOperator(*plan);
-		ConstantOrNullSimplification constant_or_null_simplification(context);
-		plan = constant_or_null_simplification.Optimize(std::move(plan));
-	});
-
-	// try to inline CTEs instead of materialization
-	RunOptimizer(OptimizerType::CTE_INLINING, [&]() {
-		CTEInlining cte_inlining(*this);
-		plan = cte_inlining.Optimize(std::move(plan));
-	});
-
-	// Rewrites AVG(x) -> SUM(x)/COUNT(x) and SUM(x+C) -> SUM(x) + C*COUNT(x)
-	RunOptimizer(OptimizerType::AGGREGATE_FUNCTION_REWRITER, [&]() {
-		AggregateFunctionRewriter aggregate_function_rewriter(*this);
-		aggregate_function_rewriter.Optimize(plan);
-	});
-
-	// perform filter pullup
-	RunOptimizer(OptimizerType::FILTER_PULLUP, [&]() {
-		FilterPullup filter_pullup;
-		plan = filter_pullup.Rewrite(std::move(plan));
-	});
-
-	// perform filter pushdown
-	RunOptimizer(OptimizerType::FILTER_PUSHDOWN, [&]() {
-		FilterPushdown filter_pushdown(*this);
-		unordered_set<TableIndex> top_bindings;
-		filter_pushdown.CheckMarkToSemi(*plan, top_bindings);
-		plan = filter_pushdown.Rewrite(std::move(plan));
-	});
-
-	if (!CTEContainsDML(*plan)) {
-		FilterStatisticsOptimizer filter_statistics(*this);
-		filter_statistics.Optimize(plan);
-	}
-
-	// derive and push filters into materialized CTEs
-	RunOptimizer(OptimizerType::CTE_FILTER_PUSHER, [&]() {
-		CTEFilterPusher cte_filter_pusher(*this);
-		plan = cte_filter_pusher.Optimize(std::move(plan));
-	});
-	CTEFilterPusher::ClearDependencies(*plan);
-
-	RunOptimizer(OptimizerType::REGEX_RANGE, [&]() {
-		RegexRangeFilter regex_opt;
-		plan = regex_opt.Rewrite(std::move(plan));
-	});
-
-	RunOptimizer(OptimizerType::IN_CLAUSE, [&]() {
-		InClauseRewriter ic_rewriter(context, *this);
-		plan = ic_rewriter.Rewrite(std::move(plan));
-	});
-
-	// removes any redundant DelimGets/DelimJoins
-	RunOptimizer(OptimizerType::DELIMINATOR, [&]() {
-		Deliminator deliminator(context);
-		plan = deliminator.Optimize(std::move(plan));
-	});
-
-	// rewrite aggregates over multiple grouping sets (ROLLUP/CUBE/GROUPING SETS) into explicit aggregate plans
-	RunOptimizer(OptimizerType::GROUPING_SETS, [&]() {
-		GroupingSetsOptimizer grouping_sets_optimizer(*this);
-		grouping_sets_optimizer.VisitOperator(plan);
-	});
-
-	// Optional aggregate recipes own their optimizer strategy; DISTINCT remains controlled by its dedicated setting.
-	MultiStageAggregateRewriter aggregate_rewriter(*this, AggregateRewritePolicy::UNCONDITIONAL,
-	                                               !OptimizerDisabled(OptimizerType::DISTINCT_AGGREGATE_REWRITE));
-	aggregate_rewriter.VisitOperator(plan);
-
-	// try to inline CTEs instead of materialization
-	RunOptimizer(OptimizerType::CTE_INLINING, [&]() {
-		CTEInlining cte_inlining(*this);
-		plan = cte_inlining.Optimize(std::move(plan));
-	});
-
-	// Pulls up empty results
-	RunOptimizer(OptimizerType::EMPTY_RESULT_PULLUP, [&]() {
-		EmptyResultPullup empty_result_pullup;
-		plan = empty_result_pullup.Optimize(std::move(plan));
-	});
-
-	// Replaces some window computations with self-joins
-	RunOptimizer(OptimizerType::WINDOW_SELF_JOIN, [&]() {
-		WindowSelfJoinOptimizer window_self_join_optimizer(*this);
-		plan = window_self_join_optimizer.Optimize(std::move(plan));
-	});
-
-	// Pull up projection from joins
-	RunOptimizer(OptimizerType::PROJECTION_PULLUP, [&]() {
-		ProjectionPullup projection_pullup(*this, plan);
-		projection_pullup.Optimize(plan);
-	});
-
-	// Simplifies FULL OUTER -> LEFT/RIGHT OUTER -> INNER if NULLs are filtered anyway
-	RunOptimizer(OptimizerType::OUTER_JOIN_SIMPLIFICATION, [&]() {
-		OuterJoinSimplification outer_join_simplification;
-		outer_join_simplification.VisitOperator(*plan);
-	});
-
-	// then we perform the join ordering optimization
-	// this also rewrites cross products + filters into joins and performs filter pushdowns
-	RunOptimizer(OptimizerType::JOIN_ORDER, [&]() {
-		JoinOrderOptimizer optimizer(context);
-		plan = optimizer.Optimize(std::move(plan));
-	});
-
-	// Reuse exact aggregate payloads exposed by filtering SEMI joins.
-	RunOptimizer(OptimizerType::AGGREGATE_REUSE, [&]() {
-		plan->ResolveOperatorTypes();
-		AggregateReuseOptimizer aggregate_reuse(*this);
-		aggregate_reuse.CollectCTEs(*plan);
-		aggregate_reuse.VisitOperator(plan);
-	});
-
-	// Pre-aggregate SUM/COUNT below joins when GROUP BY is on dimension columns
-	// and the fact side dominates cardinality — reduces probe-side work.
-	RunOptimizer(OptimizerType::PARTIAL_AGGREGATE_PUSHDOWN, [&]() {
-		PartialAggregatePushdown partial_aggregate_pushdown(*this);
-		partial_aggregate_pushdown.VisitOperator(plan);
-	});
-
-	RunOptimizer(OptimizerType::JOIN_ELIMINATION, [&]() {
-		JoinElimination join_elimination;
-		plan = join_elimination.Optimize(std::move(plan));
-	});
-
-	RunOptimizer(OptimizerType::REDUNDANT_ORDER_KEYS, [&]() {
-		RemoveRedundantOrderKeys remove_redundant_order_keys;
-		remove_redundant_order_keys.Optimize(*plan);
-	});
-
-	// rewrites UNNESTs in DelimJoins by moving them to the projection
-	RunOptimizer(OptimizerType::UNNEST_REWRITER, [&]() {
-		UnnestRewriter unnest_rewriter;
-		plan = unnest_rewriter.Optimize(std::move(plan));
-	});
-
-	// removes unused columns
-	RunOptimizer(OptimizerType::UNUSED_COLUMNS, [&]() {
-		RemoveUnusedColumns unused(*this);
-		unused.VisitOperator(plan);
-	});
-
-	// Remove duplicate groups from aggregates
-	RunOptimizer(OptimizerType::DUPLICATE_GROUPS, [&]() {
-		RemoveDuplicateGroups remove(*this);
-		remove.VisitOperator(*plan);
-	});
-
-	// then we extract common subexpressions inside the different operators
-	RunOptimizer(OptimizerType::COMMON_SUBEXPRESSIONS, [&]() {
-		CommonSubExpressionOptimizer cse_optimizer(binder);
-		cse_optimizer.VisitOperator(*plan);
-	});
-
-	// creates projection maps so unused columns are projected out early
-	RunOptimizer(OptimizerType::COLUMN_LIFETIME, [&]() {
-		ColumnLifetimeAnalyzer column_lifetime(*this, *plan, true);
-		column_lifetime.VisitOperator(*plan);
-	});
-
-	// Once we know the column lifetime, we have more information regarding
-	// what relations should be the build side/probe side.
-	RunOptimizer(OptimizerType::BUILD_SIDE_PROBE_SIDE, [&]() {
-		BuildProbeSideOptimizer build_probe_side_optimizer(context, *plan);
-		build_probe_side_optimizer.VisitOperator(*plan);
-	});
-
-	// convert common subplans into materialized CTEs
-	// Skip when the plan contains a DML CTE: table statistics are stale at plan
-	// time and could cause incorrect deduplication of scans across a DML boundary.
-	if (!CTEContainsDML(*plan)) {
-		RunOptimizer(OptimizerType::COMMON_SUBPLAN, [&]() {
-			CommonSubplanOptimizer common_subplan_optimizer(*this);
-			plan = common_subplan_optimizer.Optimize(std::move(plan));
+	for (size_t i = 0; i < iterations; ++i) {
+		// first we perform expression rewrites using the ExpressionRewriter
+		// this does not change the logical plan structure, but only simplifies the expression trees
+		RunOptimizer(OptimizerType::EXPRESSION_REWRITER, [&]() {
+			rewriter.VisitOperator(*plan);
+			ConstantOrNullSimplification constant_or_null_simplification(context);
+			plan = constant_or_null_simplification.Optimize(std::move(plan));
 		});
-	}
 
-	// pushes LIMIT below PROJECTION
-	RunOptimizer(OptimizerType::LIMIT_PUSHDOWN, [&]() {
-		LimitPushdown limit_pushdown;
-		plan = limit_pushdown.Optimize(std::move(plan));
-	});
-
-	RunOptimizer(OptimizerType::ROW_GROUP_PRUNER, [&]() {
-		RowGroupPruner row_group_pruner(context);
-		plan = row_group_pruner.Optimize(std::move(plan));
-	});
-
-	// perform sampling pushdown
-	RunOptimizer(OptimizerType::SAMPLING_PUSHDOWN, [&]() {
-		SamplingPushdown sampling_pushdown(context);
-		plan = sampling_pushdown.Optimize(std::move(plan));
-	});
-
-	// transform ORDER BY + LIMIT to TopN
-	RunOptimizer(OptimizerType::TOP_N, [&]() {
-		TopN topn(context);
-		plan = topn.Optimize(std::move(plan));
-	});
-
-	// try to use late materialization
-	RunOptimizer(OptimizerType::LATE_MATERIALIZATION, [&]() {
-		LateMaterialization late_materialization(*this);
-		plan = late_materialization.Optimize(std::move(plan));
-	});
-
-	// perform statistics propagation
-	// DML CTEs can invalidate the table statistics captured during planning.
-	column_binding_map_t<unique_ptr<BaseStatistics>> statistics_map;
-	bool propagated_statistics = false;
-	bool removed_expressions = false;
-	if (!CTEContainsDML(*plan)) {
-		RunOptimizer(OptimizerType::STATISTICS_PROPAGATION, [&]() {
-			StatisticsPropagator propagator(*this, plan);
-			propagator.PropagateStatistics(plan);
-			statistics_map = propagator.GetStatisticsMap();
-			propagated_statistics = true;
-			removed_expressions = propagator.HasRemovedExpressions();
+		// try to inline CTEs instead of materialization
+		RunOptimizer(OptimizerType::CTE_INLINING, [&]() {
+			CTEInlining cte_inlining(*this);
+			plan = cte_inlining.Optimize(std::move(plan));
 		});
-	}
-	if (propagated_statistics) {
-		MultiStageAggregateRewriter costed_rewriter(*this, AggregateRewritePolicy::COST_BASED, false, statistics_map);
-		costed_rewriter.VisitOperator(plan);
-		if (costed_rewriter.WasChanged()) {
-			StatisticsPropagator propagator(*this, plan);
-			propagator.PropagateStatistics(plan);
-			statistics_map = propagator.GetStatisticsMap();
-			removed_expressions |= propagator.HasRemovedExpressions();
+
+		// Rewrites AVG(x) -> SUM(x)/COUNT(x) and SUM(x+C) -> SUM(x) + C*COUNT(x)
+		RunOptimizer(OptimizerType::AGGREGATE_FUNCTION_REWRITER, [&]() {
+			AggregateFunctionRewriter aggregate_function_rewriter(*this);
+			aggregate_function_rewriter.Optimize(plan);
+		});
+
+		// perform filter pullup
+		RunOptimizer(OptimizerType::FILTER_PULLUP, [&]() {
+			FilterPullup filter_pullup;
+			plan = filter_pullup.Rewrite(std::move(plan));
+		});
+
+		// perform filter pushdown
+		RunOptimizer(OptimizerType::FILTER_PUSHDOWN, [&]() {
+			FilterPushdown filter_pushdown(*this);
+			unordered_set<TableIndex> top_bindings;
+			filter_pushdown.CheckMarkToSemi(*plan, top_bindings);
+			plan = filter_pushdown.Rewrite(std::move(plan));
+		});
+
+		if (!CTEContainsDML(*plan)) {
+			FilterStatisticsOptimizer filter_statistics(*this);
+			filter_statistics.Optimize(plan);
 		}
-		RunOptimizer(OptimizerType::PROJECTION_PLACEMENT, [&]() {
-			ProjectionPlacementOptimizer projection_placement(*this, statistics_map);
-			projection_placement.Optimize(plan);
+
+		// derive and push filters into materialized CTEs
+		RunOptimizer(OptimizerType::CTE_FILTER_PUSHER, [&]() {
+			CTEFilterPusher cte_filter_pusher(*this);
+			plan = cte_filter_pusher.Optimize(std::move(plan));
 		});
-	}
+		CTEFilterPusher::ClearDependencies(*plan);
 
-	// rewrite row_number window function + filter on row_number to aggregate
-	RunOptimizer(OptimizerType::TOP_N_WINDOW_ELIMINATION, [&]() {
-		TopNWindowElimination topn_window_elimination(context, *this, &statistics_map);
-		plan = topn_window_elimination.Optimize(std::move(plan));
-	});
+		RunOptimizer(OptimizerType::REGEX_RANGE, [&]() {
+			RegexRangeFilter regex_opt;
+			plan = regex_opt.Rewrite(std::move(plan));
+		});
 
-	// remove duplicate aggregates
-	RunOptimizer(OptimizerType::COMMON_AGGREGATE, [&]() {
-		CommonAggregateOptimizer common_aggregate;
-		common_aggregate.VisitOperator(*plan);
-	});
+		RunOptimizer(OptimizerType::IN_CLAUSE, [&]() {
+			InClauseRewriter ic_rewriter(context, *this);
+			plan = ic_rewriter.Rewrite(std::move(plan));
+		});
 
-	// statistics propagation removes filters, join conditions and aggregate children that it proves redundant.
-	// this can leave columns in a scan that nothing references any more - prune them again
-	if (removed_expressions) {
+		// removes any redundant DelimGets/DelimJoins
+		RunOptimizer(OptimizerType::DELIMINATOR, [&]() {
+			Deliminator deliminator(context);
+			plan = deliminator.Optimize(std::move(plan));
+		});
+
+		// rewrite aggregates over multiple grouping sets (ROLLUP/CUBE/GROUPING SETS) into explicit aggregate plans
+		RunOptimizer(OptimizerType::GROUPING_SETS, [&]() {
+			GroupingSetsOptimizer grouping_sets_optimizer(*this);
+			grouping_sets_optimizer.VisitOperator(plan);
+		});
+
+		// Optional aggregate recipes own their optimizer strategy; DISTINCT remains controlled by its dedicated setting.
+		MultiStageAggregateRewriter aggregate_rewriter(*this, AggregateRewritePolicy::UNCONDITIONAL,
+													   !OptimizerDisabled(OptimizerType::DISTINCT_AGGREGATE_REWRITE));
+		aggregate_rewriter.VisitOperator(plan);
+
+		// try to inline CTEs instead of materialization
+		RunOptimizer(OptimizerType::CTE_INLINING, [&]() {
+			CTEInlining cte_inlining(*this);
+			plan = cte_inlining.Optimize(std::move(plan));
+		});
+
+		// Pulls up empty results
+		RunOptimizer(OptimizerType::EMPTY_RESULT_PULLUP, [&]() {
+			EmptyResultPullup empty_result_pullup;
+			plan = empty_result_pullup.Optimize(std::move(plan));
+		});
+
+		// Replaces some window computations with self-joins
+		RunOptimizer(OptimizerType::WINDOW_SELF_JOIN, [&]() {
+			WindowSelfJoinOptimizer window_self_join_optimizer(*this);
+			plan = window_self_join_optimizer.Optimize(std::move(plan));
+		});
+
+		// Pull up projection from joins
+		RunOptimizer(OptimizerType::PROJECTION_PULLUP, [&]() {
+			ProjectionPullup projection_pullup(*this, plan);
+			projection_pullup.Optimize(plan);
+		});
+
+		// Simplifies FULL OUTER -> LEFT/RIGHT OUTER -> INNER if NULLs are filtered anyway
+		RunOptimizer(OptimizerType::OUTER_JOIN_SIMPLIFICATION, [&]() {
+			OuterJoinSimplification outer_join_simplification;
+			outer_join_simplification.VisitOperator(*plan);
+		});
+
+		// then we perform the join ordering optimization
+		// this also rewrites cross products + filters into joins and performs filter pushdowns
+		RunOptimizer(OptimizerType::JOIN_ORDER, [&]() {
+			JoinOrderOptimizer optimizer(context);
+			plan = optimizer.Optimize(std::move(plan));
+		});
+
+		// Reuse exact aggregate payloads exposed by filtering SEMI joins.
+		RunOptimizer(OptimizerType::AGGREGATE_REUSE, [&]() {
+			plan->ResolveOperatorTypes();
+			AggregateReuseOptimizer aggregate_reuse(*this);
+			aggregate_reuse.CollectCTEs(*plan);
+			aggregate_reuse.VisitOperator(plan);
+		});
+
+		// Pre-aggregate SUM/COUNT below joins when GROUP BY is on dimension columns
+		// and the fact side dominates cardinality — reduces probe-side work.
+		RunOptimizer(OptimizerType::PARTIAL_AGGREGATE_PUSHDOWN, [&]() {
+			PartialAggregatePushdown partial_aggregate_pushdown(*this);
+			partial_aggregate_pushdown.VisitOperator(plan);
+		});
+
+		RunOptimizer(OptimizerType::JOIN_ELIMINATION, [&]() {
+			JoinElimination join_elimination;
+			plan = join_elimination.Optimize(std::move(plan));
+		});
+
+		RunOptimizer(OptimizerType::REDUNDANT_ORDER_KEYS, [&]() {
+			RemoveRedundantOrderKeys remove_redundant_order_keys;
+			remove_redundant_order_keys.Optimize(*plan);
+		});
+
+		// rewrites UNNESTs in DelimJoins by moving them to the projection
+		RunOptimizer(OptimizerType::UNNEST_REWRITER, [&]() {
+			UnnestRewriter unnest_rewriter;
+			plan = unnest_rewriter.Optimize(std::move(plan));
+		});
+
+		// removes unused columns
 		RunOptimizer(OptimizerType::UNUSED_COLUMNS, [&]() {
-			ClearProjectionMaps(*plan);
 			RemoveUnusedColumns unused(*this);
 			unused.VisitOperator(plan);
 		});
+
+		// Remove duplicate groups from aggregates
+		RunOptimizer(OptimizerType::DUPLICATE_GROUPS, [&]() {
+			RemoveDuplicateGroups remove(*this);
+			remove.VisitOperator(*plan);
+		});
+
+		// then we extract common subexpressions inside the different operators
+		RunOptimizer(OptimizerType::COMMON_SUBEXPRESSIONS, [&]() {
+			CommonSubExpressionOptimizer cse_optimizer(binder);
+			cse_optimizer.VisitOperator(*plan);
+		});
+
+		// creates projection maps so unused columns are projected out early
+		RunOptimizer(OptimizerType::COLUMN_LIFETIME, [&]() {
+			ColumnLifetimeAnalyzer column_lifetime(*this, *plan, true);
+			column_lifetime.VisitOperator(*plan);
+		});
+
+		// Once we know the column lifetime, we have more information regarding
+		// what relations should be the build side/probe side.
+		RunOptimizer(OptimizerType::BUILD_SIDE_PROBE_SIDE, [&]() {
+			BuildProbeSideOptimizer build_probe_side_optimizer(context, *plan);
+			build_probe_side_optimizer.VisitOperator(*plan);
+		});
+
+		// convert common subplans into materialized CTEs
+		// Skip when the plan contains a DML CTE: table statistics are stale at plan
+		// time and could cause incorrect deduplication of scans across a DML boundary.
+		if (!CTEContainsDML(*plan)) {
+			RunOptimizer(OptimizerType::COMMON_SUBPLAN, [&]() {
+				CommonSubplanOptimizer common_subplan_optimizer(*this);
+				plan = common_subplan_optimizer.Optimize(std::move(plan));
+			});
+		}
+
+		// pushes LIMIT below PROJECTION
+		RunOptimizer(OptimizerType::LIMIT_PUSHDOWN, [&]() {
+			LimitPushdown limit_pushdown;
+			plan = limit_pushdown.Optimize(std::move(plan));
+		});
+
+		RunOptimizer(OptimizerType::ROW_GROUP_PRUNER, [&]() {
+			RowGroupPruner row_group_pruner(context);
+			plan = row_group_pruner.Optimize(std::move(plan));
+		});
+
+		// perform sampling pushdown
+		RunOptimizer(OptimizerType::SAMPLING_PUSHDOWN, [&]() {
+			SamplingPushdown sampling_pushdown(context);
+			plan = sampling_pushdown.Optimize(std::move(plan));
+		});
+
+		// transform ORDER BY + LIMIT to TopN
+		RunOptimizer(OptimizerType::TOP_N, [&]() {
+			TopN topn(context);
+			plan = topn.Optimize(std::move(plan));
+		});
+
+		// try to use late materialization
+		RunOptimizer(OptimizerType::LATE_MATERIALIZATION, [&]() {
+			LateMaterialization late_materialization(*this);
+			plan = late_materialization.Optimize(std::move(plan));
+		});
+
+		// perform statistics propagation
+		// DML CTEs can invalidate the table statistics captured during planning.
+		column_binding_map_t<unique_ptr<BaseStatistics>> statistics_map;
+		bool propagated_statistics = false;
+		bool removed_expressions = false;
+		if (!CTEContainsDML(*plan)) {
+			RunOptimizer(OptimizerType::STATISTICS_PROPAGATION, [&]() {
+				StatisticsPropagator propagator(*this, plan);
+				propagator.PropagateStatistics(plan);
+				statistics_map = propagator.GetStatisticsMap();
+				propagated_statistics = true;
+				removed_expressions = propagator.HasRemovedExpressions();
+			});
+		}
+		if (propagated_statistics) {
+			MultiStageAggregateRewriter costed_rewriter(*this, AggregateRewritePolicy::COST_BASED, false, statistics_map);
+			costed_rewriter.VisitOperator(plan);
+			if (costed_rewriter.WasChanged()) {
+				StatisticsPropagator propagator(*this, plan);
+				propagator.PropagateStatistics(plan);
+				statistics_map = propagator.GetStatisticsMap();
+				removed_expressions |= propagator.HasRemovedExpressions();
+			}
+			RunOptimizer(OptimizerType::PROJECTION_PLACEMENT, [&]() {
+				ProjectionPlacementOptimizer projection_placement(*this, statistics_map);
+				projection_placement.Optimize(plan);
+			});
+		}
+
+		// rewrite row_number window function + filter on row_number to aggregate
+		RunOptimizer(OptimizerType::TOP_N_WINDOW_ELIMINATION, [&]() {
+			TopNWindowElimination topn_window_elimination(context, *this, &statistics_map);
+			plan = topn_window_elimination.Optimize(std::move(plan));
+		});
+
+		// remove duplicate aggregates
+		RunOptimizer(OptimizerType::COMMON_AGGREGATE, [&]() {
+			CommonAggregateOptimizer common_aggregate;
+			common_aggregate.VisitOperator(*plan);
+		});
+
+		// statistics propagation removes filters, join conditions and aggregate children that it proves redundant.
+		// this can leave columns in a scan that nothing references any more - prune them again
+		if (removed_expressions) {
+			RunOptimizer(OptimizerType::UNUSED_COLUMNS, [&]() {
+				ClearProjectionMaps(*plan);
+				RemoveUnusedColumns unused(*this);
+				unused.VisitOperator(plan);
+			});
+		}
+
+		// creates projection maps so unused columns are projected out early
+		RunOptimizer(OptimizerType::COLUMN_LIFETIME, [&]() {
+			ColumnLifetimeAnalyzer column_lifetime(*this, *plan, true);
+			column_lifetime.VisitOperator(*plan);
+		});
+
+		// apply simple expression heuristics to get an initial reordering
+		RunOptimizer(OptimizerType::REORDER_FILTER, [&]() {
+			ExpressionHeuristics expression_heuristics(*this);
+			plan = expression_heuristics.Rewrite(std::move(plan));
+		});
+
+		// split pipelines into partitions and union them back together
+		RunOptimizer(OptimizerType::PARTITIONED_EXECUTION, [&]() {
+			PartitionedExecution partitioned_execution(*this, plan);
+			partitioned_execution.Optimize(plan);
+		});
+
+		// perform join filter pushdown after the dust has settled
+		RunOptimizer(OptimizerType::JOIN_FILTER_PUSHDOWN, [&]() {
+			JoinFilterPushdownOptimizer join_filter_pushdown(*this);
+			join_filter_pushdown.VisitOperator(*plan);
+		});
+
+		// Rewrite ROW_NUMBER() OVER() window functions to use the row_number virtual column
+		RunOptimizer(OptimizerType::ROW_NUMBER_REWRITER, [&]() {
+			RowNumberRewriter window_rewriter;
+			plan = window_rewriter.Optimize(std::move(plan));
+		});
+
+		// Push down type casts in SELECT e.g. SELECT num::UHUGEINT to file readers.
+		RunOptimizer(OptimizerType::TYPE_PUSHDOWN, [&] {
+			TypePushdown type_pushdown(context);
+			plan = type_pushdown.Optimize(std::move(plan));
+		});
+
+		// Pushdown scalar functions in SELECT like SELECT strlen(str) to readers
+		RunOptimizer(OptimizerType::SCALAR_FN_PUSHDOWN, [&] {
+			ScalarFnPushdown fn_pushdown(context);
+			plan = fn_pushdown.Optimize(std::move(plan));
+		});
 	}
-
-	// creates projection maps so unused columns are projected out early
-	RunOptimizer(OptimizerType::COLUMN_LIFETIME, [&]() {
-		ColumnLifetimeAnalyzer column_lifetime(*this, *plan, true);
-		column_lifetime.VisitOperator(*plan);
-	});
-
-	// apply simple expression heuristics to get an initial reordering
-	RunOptimizer(OptimizerType::REORDER_FILTER, [&]() {
-		ExpressionHeuristics expression_heuristics(*this);
-		plan = expression_heuristics.Rewrite(std::move(plan));
-	});
-
-	// split pipelines into partitions and union them back together
-	RunOptimizer(OptimizerType::PARTITIONED_EXECUTION, [&]() {
-		PartitionedExecution partitioned_execution(*this, plan);
-		partitioned_execution.Optimize(plan);
-	});
-
-	// perform join filter pushdown after the dust has settled
-	RunOptimizer(OptimizerType::JOIN_FILTER_PUSHDOWN, [&]() {
-		JoinFilterPushdownOptimizer join_filter_pushdown(*this);
-		join_filter_pushdown.VisitOperator(*plan);
-	});
-
-	// Rewrite ROW_NUMBER() OVER() window functions to use the row_number virtual column
-	RunOptimizer(OptimizerType::ROW_NUMBER_REWRITER, [&]() {
-		RowNumberRewriter window_rewriter;
-		plan = window_rewriter.Optimize(std::move(plan));
-	});
-
-	// Push down type casts in SELECT e.g. SELECT num::UHUGEINT to file readers.
-	RunOptimizer(OptimizerType::TYPE_PUSHDOWN, [&] {
-		TypePushdown type_pushdown(context);
-		plan = type_pushdown.Optimize(std::move(plan));
-	});
-
-	// Pushdown scalar functions in SELECT like SELECT strlen(str) to readers
-	RunOptimizer(OptimizerType::SCALAR_FN_PUSHDOWN, [&] {
-		ScalarFnPushdown fn_pushdown(context);
-		plan = fn_pushdown.Optimize(std::move(plan));
-	});
 }
 
 unique_ptr<LogicalOperator> Optimizer::LowerMandatoryAggregateRewrites(unique_ptr<LogicalOperator> plan_p) {
