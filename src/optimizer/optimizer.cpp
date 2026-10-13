@@ -116,7 +116,7 @@ Optimizer::Optimizer(Binder &binder, ClientContext &context) : context(context),
 #endif
 }
 
-constexpr size_t iterations = 5;
+constexpr size_t iterations = 2;
 
 ClientContext &Optimizer::GetContext() {
 	return context;
